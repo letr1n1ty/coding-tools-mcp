@@ -70,6 +70,8 @@ DESTRUCTIVE_RE = re.compile(
     re.I,
 )
 ABSOLUTE_PATH_RE = re.compile(r"(?<![:\w])/(?:[A-Za-z0-9._+@%=-]+/)*[A-Za-z0-9._+@%=-]+")
+MAX_HTTP_REQUEST_BYTES = 1_048_576
+MAX_JSON_RPC_BATCH_ITEMS = 50
 SESSION_BUFFER_BYTES = 1_048_576
 
 LANDLOCK_CREATE_RULESET_VERSION = 1
@@ -2191,6 +2193,16 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if posixpath.normpath(request_path) != "/mcp":
             self.send_json({"jsonrpc": "2.0", "error": {"code": -32601, "message": "Unknown endpoint"}}, status=404)
             return
+        if self.headers.get_content_type().lower() != "application/json":
+            self.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Content-Type must be application/json"},
+                },
+                status=415,
+            )
+            return
         protocol_version = self.headers.get("MCP-Protocol-Version")
         if protocol_version and protocol_version != PROTOCOL_VERSION:
             self.send_json(
@@ -2209,7 +2221,54 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if origin and not (origin.startswith("http://127.0.0.1") or origin.startswith("http://localhost")):
             self.send_json({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Origin denied"}}, status=403)
             return
-        length = int(self.headers.get("Content-Length", "0"))
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            self.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Content-Length is required"},
+                },
+                status=411,
+            )
+            return
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Content-Length must be a non-negative integer"},
+                },
+                status=400,
+            )
+            return
+        if length < 0:
+            self.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Content-Length must be a non-negative integer"},
+                },
+                status=400,
+            )
+            return
+        if length > MAX_HTTP_REQUEST_BYTES:
+            self.close_connection = True
+            self.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32600,
+                        "message": "Request body exceeds maximum size",
+                        "data": {"max_bytes": MAX_HTTP_REQUEST_BYTES},
+                    },
+                },
+                status=413,
+            )
+            return
         body = self.rfile.read(length)
         try:
             request = json.loads(body.decode("utf-8"))
@@ -2219,6 +2278,20 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if isinstance(request, list):
             if not request:
                 self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}, status=400)
+                return
+            if len(request) > MAX_JSON_RPC_BATCH_ITEMS:
+                self.send_json(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": "Batch request exceeds maximum item count",
+                            "data": {"max_items": MAX_JSON_RPC_BATCH_ITEMS},
+                        },
+                    },
+                    status=400,
+                )
                 return
             responses: list[dict[str, Any]] = []
             for item in request:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import select
 import signal
@@ -8,9 +9,11 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
+from codex_tool_runtime_mcp.server import MAX_HTTP_REQUEST_BYTES, MAX_JSON_RPC_BATCH_ITEMS
 from tests.compliance.mcp_client import (
     FORBIDDEN_TOOL_NAMES,
     FORBIDDEN_TOOL_TERMS,
@@ -183,6 +186,42 @@ class MCPContractTests(ComplianceTestCase):
         body = json.loads(cm.exception.read().decode("utf-8"))
         self.assertEqual(body.get("error", {}).get("code"), -32600)
         self.assertIn("Unsupported MCP protocol version", body.get("error", {}).get("message", ""))
+
+    def test_http_rejects_non_json_content_type(self) -> None:
+        status, body = self.raw_http_post(
+            b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}',
+            content_type="text/plain; charset=utf-8",
+        )
+        self.assertEqual(status, 415)
+        self.assertEqual(body.get("error", {}).get("code"), -32600)
+        self.assertIn("Content-Type", body.get("error", {}).get("message", ""))
+
+    def test_http_rejects_invalid_and_oversized_content_length(self) -> None:
+        invalid_status, invalid_body = self.raw_http_post(
+            b"",
+            content_length="invalid",
+        )
+        self.assertEqual(invalid_status, 400)
+        self.assertEqual(invalid_body.get("error", {}).get("code"), -32600)
+        self.assertIn("Content-Length", invalid_body.get("error", {}).get("message", ""))
+
+        oversized_status, oversized_body = self.raw_http_post(
+            b"",
+            content_length=MAX_HTTP_REQUEST_BYTES + 1,
+        )
+        self.assertEqual(oversized_status, 413)
+        self.assertEqual(oversized_body.get("error", {}).get("code"), -32600)
+        self.assertEqual(oversized_body.get("error", {}).get("data", {}).get("max_bytes"), MAX_HTTP_REQUEST_BYTES)
+
+    def test_http_rejects_oversized_json_rpc_batches(self) -> None:
+        payload = [
+            {"jsonrpc": "2.0", "id": i, "method": "ping", "params": {}}
+            for i in range(MAX_JSON_RPC_BATCH_ITEMS + 1)
+        ]
+        status, body = self.raw_http_post(json.dumps(payload).encode("utf-8"))
+        self.assertEqual(status, 400)
+        self.assertEqual(body.get("error", {}).get("code"), -32600)
+        self.assertEqual(body.get("error", {}).get("data", {}).get("max_items"), MAX_JSON_RPC_BATCH_ITEMS)
 
     def test_http_rejects_malformed_json_rpc_envelopes_and_params(self) -> None:
         cases = [
@@ -388,7 +427,7 @@ class MCPContractTests(ComplianceTestCase):
         self.assertIsNotNone(self.client.url)
         return self.raw_post_to(str(self.client.url), payload)
 
-    def raw_post_to(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def raw_post_to(self, url: str, payload: Any) -> dict[str, Any]:
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -402,6 +441,33 @@ class MCPContractTests(ComplianceTestCase):
         )
         with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def raw_http_post(
+        self,
+        body: bytes,
+        *,
+        content_type: str = "application/json",
+        content_length: int | str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        self.assertIsNotNone(self.client.url)
+        parsed = urllib.parse.urlparse(str(self.client.url))
+        self.assertEqual(parsed.scheme, "http")
+        self.assertIsNotNone(parsed.hostname)
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        try:
+            connection.putrequest("POST", parsed.path or "/mcp")
+            connection.putheader("Accept", "application/json, text/event-stream")
+            connection.putheader("Content-Type", content_type)
+            connection.putheader("MCP-Protocol-Version", "2025-06-18")
+            connection.putheader("Content-Length", str(len(body) if content_length is None else content_length))
+            connection.endheaders()
+            if body:
+                connection.send(body)
+            response = connection.getresponse()
+            response_body = response.read().decode("utf-8")
+            return response.status, json.loads(response_body)
+        finally:
+            connection.close()
 
     def start_raw_http_server(self) -> tuple[subprocess.Popen[str], str]:
         port = free_port()
