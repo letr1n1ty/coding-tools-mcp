@@ -35,6 +35,7 @@ image = [
 
 [project.scripts]
 coding-tools-mcp = "coding_tools_mcp.server:main"
+coding-tools-mcp-chatgpt = "coding_tools_mcp.chatgpt_server:main"
 
 [tool.setuptools.packages.find]
 include = ["coding_tools_mcp*"]
